@@ -1,52 +1,49 @@
 /**
  * seed.js — Seeds MongoDB with embedded medical abstract chunks.
  *
- * Flow:
- *  1. Load abstracts from abstracts.json
- *  2. Split each abstract into fixed-size text chunks (with overlap)
- *  3. Embed every chunk via Gemini text-embedding-004
- *  4. Store { text, embedding, title, pmid } documents in MongoDB
+ * KEY UPGRADE (token efficiency):
+ *   Each chunk is SHA-256 hashed. Before embedding, we check if the hash
+ *   already exists in the DB. If it does, we skip the Gemini API call.
+ *   This means re-running seed.js costs ZERO embedding tokens if nothing changed.
  *
  * Usage:
- *   GEMINI_API_KEY=<key> MONGO_URI=<uri> node seed.js
+ *   node seed.js            — skip existing chunks, embed only new ones
+ *   node seed.js --reset    — delete all seed chunks first, then re-embed everything
+ *
+ * Flow:
+ *  1. [--reset only] Delete existing seed chunks (preserves uploaded documents)
+ *  2. Load abstracts from abstracts.json
+ *  3. Chunk each abstract (500-char, 100-char overlap)
+ *  4. Hash each chunk → skip if contentHash exists in DB
+ *  5. Embed new chunks via Gemini text-embedding-001
+ *  6. Store { text, embedding, title, pmid, source, contentHash } in MongoDB
  */
 
 require("dotenv").config();
-const mongoose = require("mongoose");
+const mongoose  = require("mongoose");
+const crypto    = require("crypto");
 const { GoogleGenerativeAI } = require("@google/generative-ai");
 const abstracts = require("./abstracts.json");
+const Chunk     = require("./models/Chunk");
 
-// ─── Config ────────────────────────────────────────────────────────────────────
-const CHUNK_SIZE = 500; // characters per chunk
-const CHUNK_OVERLAP = 100; // overlap between consecutive chunks
-const EMBED_BATCH_DELAY = 300; // ms between API calls to avoid rate limits
+// ─── Config ───────────────────────────────────────────────────────────────────
+const CHUNK_SIZE    = 500;
+const CHUNK_OVERLAP = 100;
+const EMBED_DELAY   = 300; // ms between API calls
 
-const MONGO_URI = process.env.MONGO_URI || "mongodb://127.0.0.1:27017/curalink";
+const MONGO_URI     = process.env.MONGO_URI || "mongodb://127.0.0.1:27017/curalink";
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
 if (!GEMINI_API_KEY) {
-  console.error("❌  GEMINI_API_KEY is not set. Export it or add it to .env");
+  console.error("❌  GEMINI_API_KEY is not set.");
   process.exit(1);
 }
 
-const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
+const genAI       = new GoogleGenerativeAI(GEMINI_API_KEY);
+const shouldReset = process.argv.includes("--reset");
 
-// ─── Mongoose model ────────────────────────────────────────────────────────────
-const chunkSchema = new mongoose.Schema({
-  text: { type: String, required: true },
-  embedding: { type: [Number], required: true },
-  title: { type: String, required: true },
-  pmid: { type: String, required: true },
-});
+// ─── Helpers ─────────────────────────────────────────────────────────────────
 
-const Chunk = mongoose.model("Chunk", chunkSchema);
-
-// ─── Chunking ──────────────────────────────────────────────────────────────────
-/**
- * Split `text` into fixed-size chunks with overlap.
- * Each chunk is at most CHUNK_SIZE characters, and consecutive chunks
- * share CHUNK_OVERLAP characters so context isn't lost at boundaries.
- */
 function chunkText(text) {
   const chunks = [];
   let start = 0;
@@ -59,49 +56,71 @@ function chunkText(text) {
   return chunks;
 }
 
-// ─── Embedding ─────────────────────────────────────────────────────────────────
-/**
- * Embed a single text string using Gemini text-embedding-004.
- * Returns a flat array of floats (the embedding vector).
- */
+function sha256(str) {
+  return crypto.createHash("sha256").update(str).digest("hex");
+}
+
 async function embedText(text) {
-  const model = genAI.getGenerativeModel({ model: "text-embedding-004" });
+  const model  = genAI.getGenerativeModel({ model: "gemini-embedding-001" });
   const result = await model.embedContent(text);
   return result.embedding.values;
 }
 
-// ─── Main ──────────────────────────────────────────────────────────────────────
+// ─── Main ─────────────────────────────────────────────────────────────────────
 async function main() {
   console.log("🔌  Connecting to MongoDB…");
   await mongoose.connect(MONGO_URI);
   console.log("✅  Connected to MongoDB");
 
-  // Drop existing chunks so re-running seed is idempotent
-  await Chunk.deleteMany({});
-  console.log("🗑   Cleared existing chunks\n");
+  if (shouldReset) {
+    // Only delete seed chunks — uploaded documents are preserved
+    const { deletedCount } = await Chunk.deleteMany({ source: "seed" });
+    console.log(`🗑   Cleared ${deletedCount} seed chunks (uploaded documents preserved)\n`);
+  } else {
+    const existingCount = await Chunk.countDocuments({ source: "seed" });
+    console.log(`ℹ️   Found ${existingCount} existing seed chunks — will skip duplicates\n`);
+  }
 
-  let totalChunks = 0;
+  let totalEmbedded = 0;
+  let totalSkipped  = 0;
 
   for (let i = 0; i < abstracts.length; i++) {
     const { pmid, title, abstract: abstractText } = abstracts[i];
-    // Combine title + abstract for richer chunks
     const fullText = `${title}. ${abstractText}`;
-    const chunks = chunkText(fullText);
+    const chunks   = chunkText(fullText);
 
-    console.log(
-      `📄  [${i + 1}/${abstracts.length}] "${title.slice(0, 60)}…" → ${chunks.length} chunk(s)`
-    );
+    console.log(`📄  [${i + 1}/${abstracts.length}] "${title.slice(0, 55)}…" → ${chunks.length} chunk(s)`);
 
-    for (const chunkText of chunks) {
-      const embedding = await embedText(chunkText);
-      await Chunk.create({ text: chunkText, embedding, title, pmid });
-      totalChunks++;
-      // Small delay to stay under Gemini rate limits
-      await new Promise((r) => setTimeout(r, EMBED_BATCH_DELAY));
+    for (const chunk of chunks) {
+      const hash   = sha256(chunk);
+      const exists = await Chunk.findOne({ contentHash: hash }).lean();
+
+      if (exists) {
+        process.stdout.write("  ⏭ ");
+        totalSkipped++;
+        continue;
+      }
+
+      const embedding = await embedText(chunk);
+      await Chunk.create({
+        text:        chunk,
+        embedding,
+        title,
+        pmid,
+        source:      "seed",
+        contentHash: hash,
+      });
+      process.stdout.write("  ✓ ");
+      totalEmbedded++;
+
+      await new Promise((r) => setTimeout(r, EMBED_DELAY));
     }
+    console.log(); // newline after chunk indicators
   }
 
-  console.log(`\n🎉  Seeded ${totalChunks} chunks from ${abstracts.length} abstracts.`);
+  console.log(
+    `\n🎉  Done. Embedded: ${totalEmbedded} new chunks | Skipped: ${totalSkipped} (already existed).`
+  );
   await mongoose.disconnect();
 }
 
