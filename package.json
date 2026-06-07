@@ -1,0 +1,12 @@
+{
+  "name": "curalink",
+  "version": "1.0.0",
+  "description": "A minimal MERN-stack (MongoDB, Express, React, Node) RAG assistant that answers medical research questions grounded in PubMed-style abstracts, powered by Google Gemini.",
+  "license": "ISC",
+  "author": "",
+  "type": "commonjs",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  }
+}
